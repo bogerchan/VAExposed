@@ -195,6 +195,10 @@ public class VEnvironment {
         return ensureCreated(new File(DATA_DIRECTORY, ".session_dir"));
     }
 
+    public static File getPermissionManagerFile() {
+        return new File(getSystemSecureDirectory(), "perm-mgr.ini");
+    }
+
     public static boolean isAndroidO() {
         return Build.VERSION.SDK_INT > 25;
     }
