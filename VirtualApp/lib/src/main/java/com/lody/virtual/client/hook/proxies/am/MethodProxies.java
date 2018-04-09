@@ -27,9 +27,11 @@ import android.os.Bundle;
 import android.os.IBinder;
 import android.os.IInterface;
 import android.os.RemoteException;
+import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.TypedValue;
 
+import com.lody.virtual.client.NativeEngine;
 import com.lody.virtual.client.VClientImpl;
 import com.lody.virtual.client.badger.BadgerManager;
 import com.lody.virtual.client.core.VirtualCore;
@@ -64,10 +66,6 @@ import com.lody.virtual.remote.AppTaskInfo;
 import com.lody.virtual.server.interfaces.IAppRequestListener;
 
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.util.List;
@@ -402,6 +400,10 @@ class MethodProxies {
                 if (handleUninstallRequest(intent)) {
                     return 0;
                 }
+            } else if (MediaStore.ACTION_IMAGE_CAPTURE.equals(intent.getAction()) ||
+                    MediaStore.ACTION_VIDEO_CAPTURE.equals(intent.getAction()) ||
+                    MediaStore.ACTION_IMAGE_CAPTURE_SECURE.equals(intent.getAction())) {
+                handleMediaCaptureRequest(intent);
             }
 
             String resultWho = null;
@@ -432,7 +434,7 @@ class MethodProxies {
 
             ActivityInfo activityInfo = VirtualCore.get().resolveActivityInfo(intent, userId);
             if (activityInfo == null) {
-                VLog.e("VActivityManager", "Unable to resolve activityInfo : " + intent);
+                VLog.e("VActivityManager", "Unable to resolve activityInfo : %s", intent);
                 if (intent.getPackage() != null && isAppPkg(intent.getPackage())) {
                     return ActivityManagerCompat.START_INTENT_NOT_RESOLVED;
                 }
@@ -473,42 +475,13 @@ class MethodProxies {
             IAppRequestListener listener = VirtualCore.get().getAppRequestListener();
             if (listener != null) {
                 Uri packageUri = intent.getData();
-                if (SCHEME_FILE.equals(packageUri.getScheme())) {
-                    File sourceFile = new File(packageUri.getPath());
-                    try {
-                        listener.onRequestInstall(sourceFile.getPath());
-                        return true;
-                    } catch (RemoteException e) {
-                        e.printStackTrace();
-                    }
-                } else if (SCHEME_CONTENT.equals(packageUri.getScheme())){
-                    InputStream inputStream = null;
-                    OutputStream outputStream = null;
-                    File sharedFileCopy = new File(getHostContext().getCacheDir(), packageUri.getLastPathSegment());
-                    try {
-                        inputStream = getHostContext().getContentResolver().openInputStream(packageUri);
-                        outputStream = new FileOutputStream(sharedFileCopy);
-                        byte[] buffer = new byte[1024];
-                        int count;
-                        while ((count = inputStream.read(buffer)) > 0) {
-                            outputStream.write(buffer, 0, count);
-                        }
-                        outputStream.flush();
-
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    } finally {
-                        FileUtils.closeQuietly(inputStream);
-                        FileUtils.closeQuietly(outputStream);
-                    }
-                    try {
-                        listener.onRequestInstall(sharedFileCopy.getPath());
-                        return true;
-                    } catch (RemoteException e) {
-                        e.printStackTrace();
-                    }
+                String sourcePath = FileUtils.getFileFromUri(getHostContext(), packageUri);
+                try {
+                    listener.onRequestInstall(sourcePath);
+                    return true;
+                } catch (RemoteException e) {
+                    e.printStackTrace();
                 }
-
             }
             return false;
         }
@@ -529,6 +502,21 @@ class MethodProxies {
 
             }
             return false;
+        }
+
+        private void handleMediaCaptureRequest(Intent intent) {
+            Uri uri = intent.getParcelableExtra(MediaStore.EXTRA_OUTPUT);
+            if (uri == null || !SCHEME_FILE.equals(uri.getScheme())) {
+                return;
+            }
+            String path = uri.getPath();
+            String newPath = NativeEngine.getRedirectedPath(path);
+            if (newPath == null) {
+                return;
+            }
+            File realFile = new File(newPath);
+            Uri newUri = Uri.fromFile(realFile);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, newUri);
         }
 
     }
@@ -1545,9 +1533,37 @@ class MethodProxies {
 
             } else if (BadgerManager.handleBadger(intent)) {
                 return null;
+            } else if (Intent.ACTION_MEDIA_SCANNER_SCAN_FILE.equals(action)) {
+                // intent send to system, do not modify it's action(may have other same intent)
+                return handleMediaScannerIntent(intent);
             } else {
                 return ComponentUtils.redirectBroadcastIntent(intent, VUserHandle.myUserId());
             }
+            return intent;
+        }
+
+        private Intent handleMediaScannerIntent(Intent intent) {
+            if (intent == null) {
+                return null;
+            }
+            Uri data = intent.getData();
+            if (data == null) {
+                return intent;
+            }
+            String scheme = data.getScheme();
+            if (!"file".equalsIgnoreCase(scheme)) {
+                return intent;
+            }
+            String path = data.getPath();
+            if (path == null) {
+                return intent;
+            }
+            String newPath = NativeEngine.getRedirectedPath(path);
+            File newFile = new File(newPath);
+            if (!newFile.exists()) {
+                return intent;
+            }
+            intent.setData(Uri.fromFile(newFile));
             return intent;
         }
 

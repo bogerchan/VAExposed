@@ -1,9 +1,14 @@
 package io.virtualapp.home;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
+import android.database.Cursor;
+import android.graphics.drawable.ColorDrawable;
+import android.net.Uri;
 import android.os.Bundle;
 import android.support.annotation.Nullable;
+import android.support.v7.widget.DividerItemDecoration;
 import android.support.v7.widget.OrientationHelper;
 import android.support.v7.widget.StaggeredGridLayoutManager;
 import android.view.LayoutInflater;
@@ -19,25 +24,27 @@ import java.util.List;
 import java.util.Locale;
 
 import io.virtualapp.R;
-import io.virtualapp.VApp;
-import io.virtualapp.VCommends;
+import io.virtualapp.XApp;
 import io.virtualapp.abs.ui.VFragment;
-import io.virtualapp.abs.ui.VUiKit;
 import io.virtualapp.home.adapters.CloneAppListAdapter;
-import io.virtualapp.home.adapters.decorations.ItemOffsetDecoration;
 import io.virtualapp.home.models.AppInfo;
 import io.virtualapp.home.models.AppInfoLite;
+import io.virtualapp.sys.Installd;
 import io.virtualapp.widgets.DragSelectRecyclerView;
+
 
 /**
  * @author Lody
  */
 public class ListAppFragment extends VFragment<ListAppContract.ListAppPresenter> implements ListAppContract.ListAppView {
     private static final String KEY_SELECT_FROM = "key_select_from";
+    private static final int REQUEST_GET_FILE = 1;
+
     private DragSelectRecyclerView mRecyclerView;
     private ProgressBar mProgressBar;
     private Button mInstallButton;
     private CloneAppListAdapter mAdapter;
+    private View mSelectFromExternal;
 
     public static ListAppFragment newInstance(File selectFrom) {
         Bundle args = new Bundle();
@@ -76,8 +83,11 @@ public class ListAppFragment extends VFragment<ListAppContract.ListAppPresenter>
         mRecyclerView = (DragSelectRecyclerView) view.findViewById(R.id.select_app_recycler_view);
         mProgressBar = (ProgressBar) view.findViewById(R.id.select_app_progress_bar);
         mInstallButton = (Button) view.findViewById(R.id.select_app_install_btn);
-        mRecyclerView.setLayoutManager(new StaggeredGridLayoutManager(3, OrientationHelper.VERTICAL));
-        mRecyclerView.addItemDecoration(new ItemOffsetDecoration(VUiKit.dpToPx(getContext(), 2)));
+        mSelectFromExternal = view.findViewById(R.id.select_app_from_external);
+        mRecyclerView.setLayoutManager(new StaggeredGridLayoutManager(1, OrientationHelper.VERTICAL));
+        DividerItemDecoration dividerItemDecoration = new DividerItemDecoration(getContext(), DividerItemDecoration.VERTICAL);
+        dividerItemDecoration.setDrawable(new ColorDrawable(0x1f000000));
+        mRecyclerView.addItemDecoration(dividerItemDecoration);
         mAdapter = new CloneAppListAdapter(getActivity());
         mRecyclerView.setAdapter(mAdapter);
         mAdapter.setOnItemClickListener(new CloneAppListAdapter.ItemEventListener() {
@@ -100,19 +110,28 @@ public class ListAppFragment extends VFragment<ListAppContract.ListAppPresenter>
         });
         mAdapter.setSelectionListener(count -> {
             mInstallButton.setEnabled(count > 0);
-            mInstallButton.setText(String.format(Locale.ENGLISH, VApp.getApp().getResources().getString(R.string.install_d), count));
+            mInstallButton.setText(String.format(Locale.ENGLISH, XApp.getApp().getResources().getString(R.string.install_d), count));
         });
         mInstallButton.setOnClickListener(v -> {
             Integer[] selectedIndices = mAdapter.getSelectedIndices();
             ArrayList<AppInfoLite> dataList = new ArrayList<AppInfoLite>(selectedIndices.length);
             for (int index : selectedIndices) {
                 AppInfo info = mAdapter.getItem(index);
-                dataList.add(new AppInfoLite(info.packageName, info.path, info.fastOpen));
+                dataList.add(new AppInfoLite(info.packageName, info.path, info.fastOpen, info.disableMultiVersion));
             }
-            Intent data = new Intent();
-            data.putParcelableArrayListExtra(VCommends.EXTRA_APP_INFO_LIST, dataList);
-            getActivity().setResult(Activity.RESULT_OK, data);
+
+            Installd.startInstallerActivity(getActivity(), dataList);
             getActivity().finish();
+        });
+        mSelectFromExternal.setOnClickListener(v -> {
+            Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+            intent.setType("application/vnd.android.package-archive"); // apk file
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+            try {
+                startActivityForResult(intent, REQUEST_GET_FILE);
+            } catch (Throwable ignored) {
+                Toast.makeText(getActivity(), "Error", Toast.LENGTH_SHORT).show();
+            }
         });
         new ListAppPresenterImpl(getActivity(), this, getSelectFrom()).start();
     }
@@ -137,4 +156,50 @@ public class ListAppFragment extends VFragment<ListAppContract.ListAppPresenter>
         this.mPresenter = presenter;
     }
 
+    @Override
+    public void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (!(requestCode == REQUEST_GET_FILE && resultCode == Activity.RESULT_OK)) {
+            return;
+        }
+        Activity current = getActivity();
+        if (current == null) {
+            return;
+        }
+
+        Uri uri = data.getData();
+        String path = getPath(getActivity(), uri);
+        if (path == null) {
+            return;
+        }
+        Installd.handleRequestFromFile(getActivity(), path);
+
+        getActivity().finish();
+    }
+
+    public static String getPath(Context context, Uri uri) {
+        if (uri == null) {
+            return null;
+        }
+        if ("content".equalsIgnoreCase(uri.getScheme())) {
+            String[] projection = {"_data"};
+            Cursor cursor = null;
+            try {
+                cursor = context.getContentResolver().query(uri, projection, null, null, null);
+                int column_index = cursor.getColumnIndexOrThrow("_data");
+                if (cursor.moveToFirst()) {
+                    return cursor.getString(column_index);
+                }
+            } catch (Exception e) {
+                // Eat it  Or Log it.
+            } finally {
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+        } else if ("file".equalsIgnoreCase(uri.getScheme())) {
+            return uri.getPath();
+        }
+        return null;
+    }
 }

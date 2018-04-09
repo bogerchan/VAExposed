@@ -21,9 +21,12 @@ import android.graphics.drawable.Icon;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
+import android.os.IBinder;
 import android.os.Looper;
 import android.os.Process;
 import android.os.RemoteException;
+import android.text.TextUtils;
+import android.widget.Toast;
 
 import com.lody.virtual.R;
 import com.lody.virtual.client.VClientImpl;
@@ -49,10 +52,10 @@ import com.lody.virtual.server.interfaces.IPackageObserver;
 import com.lody.virtual.server.interfaces.IUiCallback;
 
 import java.io.IOException;
-import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 
-import dalvik.system.DexFile;
 import mirror.android.app.ActivityThread;
 
 /**
@@ -259,7 +262,7 @@ public final class VirtualCore {
 
     private IAppManager getService() {
         if (mService == null
-                || (!VirtualCore.get().isVAppProcess() && !mService.asBinder().isBinderAlive())) {
+                || (!VirtualCore.get().isVAppProcess() && !mService.asBinder().pingBinder())) {
             synchronized (this) {
                 Object remote = getStubInterface();
                 mService = LocalProxyUtils.genProxy(IAppManager.class, remote);
@@ -323,10 +326,11 @@ public final class VirtualCore {
      */
     @Deprecated
     public void preOpt(String pkg) throws IOException {
+        /*
         InstalledAppInfo info = getInstalledAppInfo(pkg, 0);
         if (info != null && !info.dependSystem) {
             DexFile.loadDex(info.apkPath, info.getOdexFile().getPath(), 0).close();
-        }
+        }*/
     }
 
     /**
@@ -343,6 +347,22 @@ public final class VirtualCore {
     public InstallResult installPackage(String apkPath, int flags) {
         try {
             return getService().installPackage(apkPath, flags);
+        } catch (RemoteException e) {
+            return VirtualRuntime.crash(e);
+        }
+    }
+
+    public boolean clearPackage(String packageName) {
+        try {
+            return getService().clearPackage(packageName);
+        } catch (RemoteException e) {
+            return VirtualRuntime.crash(e);
+        }
+    }
+
+    public boolean clearPackageAsUser(int userId, String packageName) {
+        try {
+            return getService().clearPackageAsUser(userId, packageName);
         } catch (RemoteException e) {
             return VirtualRuntime.crash(e);
         }
@@ -446,7 +466,7 @@ public final class VirtualCore {
         if (targetIntent == null) {
             return false;
         }
-        Intent shortcutIntent = new Intent();
+        Intent shortcutIntent = new Intent(Intent.ACTION_VIEW);
         shortcutIntent.setClassName(getHostPkg(), Constants.SHORTCUT_PROXY_ACTIVITY_NAME);
         shortcutIntent.addCategory(Intent.CATEGORY_DEFAULT);
         if (splash != null) {
@@ -459,59 +479,90 @@ public final class VirtualCore {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N_MR1) {
             // bad parcel.
             shortcutIntent.removeExtra("_VA_|_intent_");
+
+            Icon withBitmap = Icon.createWithBitmap(icon);
+            ShortcutInfo likeShortcut = new ShortcutInfo.Builder(context, id)
+                    .setShortLabel(name)
+                    .setLongLabel(name)
+                    .setIcon(withBitmap)
+                    .setIntent(shortcutIntent)
+                    .build();
+
             // crate app shortcuts.
-            createShortcutAboveN(context, id, name, icon, shortcutIntent);
+            createShortcutAboveN(context, likeShortcut);
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                return createDeskShortcutAboveO(context, likeShortcut);
+            }
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            return createDeskShortcutAboveO(context, id, name, icon, shortcutIntent);
-        }
 
         Intent addIntent = new Intent();
         addIntent.putExtra(Intent.EXTRA_SHORTCUT_INTENT, shortcutIntent);
         addIntent.putExtra(Intent.EXTRA_SHORTCUT_NAME, name);
         addIntent.putExtra(Intent.EXTRA_SHORTCUT_ICON, icon);
         addIntent.setAction("com.android.launcher.action.INSTALL_SHORTCUT");
-        context.sendBroadcast(addIntent);
+        try {
+            context.sendBroadcast(addIntent);
+        } catch (Throwable ignored) {
+            return false;
+        }
         return true;
     }
 
     @TargetApi(Build.VERSION_CODES.N_MR1)
-    private static boolean createShortcutAboveN(Context context, String id, String label, Bitmap icon, Intent intent) {
-        intent.setAction(Intent.ACTION_VIEW);
-
-        Icon withBitmap = Icon.createWithBitmap(icon);
-        ShortcutInfo likeShortcut = new ShortcutInfo.Builder(context, id)
-                .setShortLabel(label)
-                .setIcon(withBitmap)
-                .setIntent(intent)
-                .build();
-
+    private static boolean createShortcutAboveN(Context context, ShortcutInfo likeShortcut) {
         ShortcutManager shortcutManager = context.getSystemService(ShortcutManager.class);
         if (shortcutManager == null) {
             return false;
         }
-        shortcutManager.setDynamicShortcuts(Arrays.asList(likeShortcut));
-        return true;
+        try {
+            int max = shortcutManager.getMaxShortcutCountPerActivity();
+            List<ShortcutInfo> dynamicShortcuts = shortcutManager.getDynamicShortcuts();
+            if (dynamicShortcuts.size() >= max) {
+                Collections.sort(dynamicShortcuts, new Comparator<ShortcutInfo>() {
+                    @Override
+                    public int compare(ShortcutInfo o1, ShortcutInfo o2) {
+                        long r = o1.getLastChangedTimestamp() - o2.getLastChangedTimestamp();
+                        return r == 0 ? 0 : (r > 0 ? 1 : -1);
+                    }
+                });
+
+                ShortcutInfo remove = dynamicShortcuts.remove(0);// remove old.
+                shortcutManager.removeDynamicShortcuts(Collections.singletonList(remove.getId()));
+            }
+
+            shortcutManager.addDynamicShortcuts(Collections.singletonList(likeShortcut));
+            return true;
+        } catch (Throwable e) {
+            return false;
+        }
     }
 
     @TargetApi(Build.VERSION_CODES.O)
-    private static boolean createDeskShortcutAboveO(Context context, String id, String label, Bitmap icon, Intent intent) {
+    private static boolean createDeskShortcutAboveO(Context context, ShortcutInfo info) {
         ShortcutManager shortcutManager = context.getSystemService(ShortcutManager.class);
         if (shortcutManager == null) {
             return false;
         }
         if (shortcutManager.isRequestPinShortcutSupported()) {
-            ShortcutInfo info = new ShortcutInfo.Builder(context, id)
-                    .setIcon(Icon.createWithBitmap(icon))
-                    .setShortLabel(label)
-                    .setIntent(intent)
-                    .build();
             // 当添加快捷方式的确认弹框弹出来时，将被回调
             // PendingIntent shortcutCallbackIntent = PendingIntent.getBroadcast(context, 0,
             // new Intent(context, MyReceiver.class), PendingIntent.FLAG_UPDATE_CURRENT);
 
-            shortcutManager.requestPinShortcut(info, null);
+            List<ShortcutInfo> pinnedShortcuts = shortcutManager.getPinnedShortcuts();
+            boolean exists = false;
+            for (ShortcutInfo pinnedShortcut : pinnedShortcuts) {
+                if (TextUtils.equals(pinnedShortcut.getId(), info.getId())) {
+                    // already exist.
+                    exists = true;
+                    Toast.makeText(context, R.string.create_shortcut_already_exist, Toast.LENGTH_SHORT).show();
+                    break;
+                }
+            }
+            if (!exists) {
+                shortcutManager.requestPinShortcut(info, null);
+            }
             return true;
         }
         return false;
@@ -568,6 +619,25 @@ public final class VirtualCore {
             BundleCompat.putBinder(bundle, "_VA_|_ui_callback_", callback.asBinder());
             intent.putExtra("_VA_|_sender_", bundle);
         }
+    }
+
+    public static IUiCallback getUiCallback(Intent intent) {
+        if (intent == null) {
+            return null;
+        }
+        // only for launch intent.
+        if (!Intent.ACTION_MAIN.equals(intent.getAction())) {
+            return null;
+        }
+        try {
+            Bundle bundle = intent.getBundleExtra("_VA_|_sender_");
+            if (bundle != null) {
+                IBinder uicallbackToken = BundleCompat.getBinder(bundle, "_VA_|_ui_callback_");
+                return IUiCallback.Stub.asInterface(uicallbackToken);
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     public InstalledAppInfo getInstalledAppInfo(String pkg, int flags) {

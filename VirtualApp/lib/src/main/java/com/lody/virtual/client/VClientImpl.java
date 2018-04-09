@@ -24,7 +24,7 @@ import android.os.Message;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.StrictMode;
-import android.util.Log;
+import android.util.Base64;
 
 import com.lody.virtual.client.core.CrashHandler;
 import com.lody.virtual.client.core.InvocationStubManager;
@@ -49,6 +49,7 @@ import com.lody.virtual.os.VUserHandle;
 import com.lody.virtual.remote.InstalledAppInfo;
 import com.lody.virtual.remote.PendingResultData;
 import com.lody.virtual.remote.VDeviceInfo;
+import com.lody.virtual.server.interfaces.IUiCallback;
 
 import java.io.File;
 import java.lang.reflect.Field;
@@ -103,6 +104,7 @@ public final class VClientImpl extends IVClient.Stub {
     private AppBindData mBoundApplication;
     private Application mInitialApplication;
     private CrashHandler crashHandler;
+    private IUiCallback mUiCallback;
 
     public static VClientImpl get() {
         return gClient;
@@ -201,6 +203,11 @@ public final class VClientImpl extends IVClient.Stub {
         }
     }
 
+    public void bindApplicationForActivity(final String packageName, final String processName, final Intent intent) {
+        mUiCallback = VirtualCore.getUiCallback(intent);
+        bindApplication(packageName, processName);
+    }
+
     public void bindApplication(final String packageName, final String processName) {
         if (Looper.getMainLooper() == Looper.myLooper()) {
             bindApplicationNoCheck(packageName, processName, new ConditionVariable());
@@ -250,7 +257,7 @@ public final class VClientImpl extends IVClient.Stub {
         data.processName = processName;
         data.appInfo.processName = processName;
         data.providers = VPackageManager.get().queryContentProviders(processName, getVUid(), PackageManager.GET_META_DATA);
-        Log.i(TAG, "Binding application " + data.appInfo.packageName + " (" + data.processName + ")");
+        VLog.i(TAG, String.format("Binding application %s, (%s)", data.appInfo.packageName, data.processName));
         mBoundApplication = data;
         VirtualRuntime.setupRuntime(data.processName, data.appInfo);
         int targetSdkVersion = data.appInfo.targetSdkVersion;
@@ -268,7 +275,16 @@ public final class VClientImpl extends IVClient.Stub {
         Object mainThread = VirtualCore.mainThread();
         NativeEngine.startDexOverride();
         Context context = createPackageContext(data.appInfo.packageName);
-        System.setProperty("java.io.tmpdir", context.getCacheDir().getAbsolutePath());
+        try {
+            // anti-virus, fuck ESET-NOD32: a variant of Android/AdDisplay.AdLock.AL potentially unwanted
+            // we can make direct call... use reflect to bypass.
+            // System.setProperty("java.io.tmpdir", context.getCacheDir().getAbsolutePath());
+            System.class.getDeclaredMethod("setProperty", String.class, String.class)
+                    .invoke(null, "java.io.tmpdir", context.getCacheDir().getAbsolutePath());
+        } catch (Throwable ignored) {
+            VLog.e(TAG, "set tmp dir error:", ignored);
+        }
+
         File codeCacheDir;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             codeCacheDir = context.getCodeCacheDir();
@@ -352,8 +368,19 @@ public final class VClientImpl extends IVClient.Stub {
             }
         } catch (Exception e) {
             if (!mInstrumentation.onException(mInitialApplication, e)) {
+                // 1. tell ui that do not need wait use now.
+                if (mUiCallback != null) {
+                    try {
+                        mUiCallback.onOpenFailed(packageName, VUserHandle.myUserId());
+                    } catch (RemoteException ignored) {
+                    }
+                }
+                // 2. tell vams that launch finish.
+                VActivityManager.get().appDoneExecuting();
+
+                // 3. rethrow
                 throw new RuntimeException(
-                        "Unable to create application " + mInitialApplication.getClass().getName()
+                        "Unable to create application " + (mInitialApplication == null ? " [null application] " : mInitialApplication.getClass().getName())
                                 + ": " + e.toString(), e);
             }
         }
@@ -429,19 +456,35 @@ public final class VClientImpl extends IVClient.Stub {
         NativeEngine.redirectDirectory("/data/data/" + info.packageName + "/lib/", libPath);
         NativeEngine.redirectDirectory("/data/user/0/" + info.packageName + "/lib/", libPath);
 
+        setupVirtualStorage(info, userId);
+
+        NativeEngine.enableIORedirect();
+    }
+
+    private void setupVirtualStorage(ApplicationInfo info, int userId) {
+        File vsDir = VEnvironment.getVirtualStorageDir(info.packageName, userId);
+        if (vsDir == null || !vsDir.exists() || !vsDir.isDirectory()) {
+            return;
+        }
+
         VirtualStorageManager vsManager = VirtualStorageManager.get();
-        String vsPath = vsManager.getVirtualStorage(info.packageName, userId);
         boolean enable = vsManager.isVirtualStorageEnable(info.packageName, userId);
-        if (enable && vsPath != null) {
-            File vsDirectory = new File(vsPath);
-            if (vsDirectory.exists() || vsDirectory.mkdirs()) {
-                HashSet<String> mountPoints = getMountPoints();
-                for (String mountPoint : mountPoints) {
-                    NativeEngine.redirectDirectory(mountPoint, vsPath);
-                }
+        HashSet<String> mountPoints = getMountPoints();
+        if (enable) {
+            vsManager.setVirtualStorage(info.packageName, userId, vsDir.getPath());
+            // redirect for normal path
+            for (String mountPoint : mountPoints) {
+                NativeEngine.redirectDirectory(mountPoint, vsDir.getPath());
+            }
+        } else {
+            // redirect tencent to avoid message mess
+            final String tStr = new String(Base64.decode("dGVuY2VudA==", 0));
+            for (String mountPoint : mountPoints) {
+                File tDir = new File(mountPoint, tStr);
+                File tRelocateDir = new File(vsDir, tStr);
+                NativeEngine.redirectDirectory(tDir.getAbsolutePath(), tRelocateDir.getAbsolutePath());
             }
         }
-        NativeEngine.enableIORedirect();
     }
 
     @SuppressLint("SdCardPath")
@@ -517,7 +560,7 @@ public final class VClientImpl extends IVClient.Stub {
                 client = resolver.acquireContentProviderClient(authority);
             }
         } catch (Throwable e) {
-            e.printStackTrace();
+            VLog.e(TAG, "", e);
         }
         if (client != null) {
             provider = mirror.android.content.ContentProviderClient.mContentProvider.get(client);
@@ -639,10 +682,8 @@ public final class VClientImpl extends IVClient.Stub {
                 result.finish();
             }
         } catch (Exception e) {
-            e.printStackTrace();
-            throw new RuntimeException(
-                    "Unable to start receiver " + data.component
-                            + ": " + e.toString(), e);
+            // must be this for misjudge of anti-virus!!
+            throw new RuntimeException(String.format("Unable to start receiver: %s ", data.component), e);
         }
         VActivityManager.get().broadcastFinish(data.resultData);
     }

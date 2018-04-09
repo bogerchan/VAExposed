@@ -127,7 +127,7 @@ public class NativeEngine {
         try {
             String soPath = String.format("/data/data/%s/lib/libva++.so", VirtualCore.get().getHostPkg());
             if (!new File(soPath).exists()) {
-                throw new RuntimeException("Unable to find the so.");
+                throw new RuntimeException("io redirect failed.");
             }
             nativeEnableIORedirect(soPath, Build.VERSION.SDK_INT, BuildCompat.getPreviewSDKInt());
         } catch (Throwable e) {
@@ -167,7 +167,7 @@ public class NativeEngine {
         if (vuid != -1) {
             return VUserHandle.getAppId(vuid);
         }
-        VLog.d(TAG, "Unknown uid: " + callingPid);
+        VLog.w(TAG, String.format("Unknown uid: %s", callingPid));
         return VClientImpl.get().getBaseVUid();
     }
 
@@ -203,6 +203,8 @@ public class NativeEngine {
     private static native void nativeIOForbid(String path);
 
     private static native void nativeEnableIORedirect(String selfSoPath, int apiLevel, int previewApiLevel);
+
+    public static native void disableJit();
 
     public static int onGetUid(int uid) {
         return VClientImpl.get().getBaseVUid();
